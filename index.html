@@ -409,7 +409,7 @@ function computeDamage(src,dst,ab,defMulOverride){
   let raw=ab.base/100*src.atk;
   let dmg=raw*(1+(se-de)*0.20);
   if(ab.ignoresDef){
-    dmg*=(1-dst.eva/200);
+    dmg*=(1-dst.eva/400);
   }else{
     const armor=Math.max(0.35, 1-defBase/(defBase+dmg));
     dmg*=armor;
@@ -495,7 +495,7 @@ function aiChooseAction(u){
     if(healAbName&&tx===u.x&&ty===u.y){
       const hb=AB[healAbName];
       const missing=u.hpMax-u.hp;
-      if(missing>40&&u.mp>=hb.mp) consider(tx,ty,{kind:"heal",ab:healAbName},Math.min(missing,hb.base)*1.4);
+      if(missing>40&&u.mp>=hb.mp) consider(tx,ty,{kind:"heal",ab:healAbName},Math.min(missing,hb.base)*1.4-hb.mp*2);
     }
     for(const f of foes){
       const d=dist({x:tx,y:ty},f);
@@ -955,7 +955,7 @@ function newBattle(seed){
     units.push(makeUnit(foeName,cls,"enemy",s.x,s.y));
   });
   G={
-    side:"player", over:null, selected:null, mode:null,
+    side:"player", over:null, selected:null, mode:null, gen:0,
     reach:new Map(),
     animQueue:[], busy:false,
     flavor:pick(FLAVOR), youName, foeName, youCls:youCls.slice(), foeCls:foeCls.slice(),
@@ -997,6 +997,7 @@ function showIntro(){
   };
 }
 function startTurnPhase(side){
+  G.gen++; // invalidate any phase callbacks still pending from a previous phase
   G.side=side; G.selected=null; G.mode=null; G.reach=new Map(); lastAbName=null;
   units.forEach(u=>{ if(u.side===side) u.used=false; }); // fresh phase: everyone may act
   const alive=units.filter(u=>u.alive&&u.side===side);
@@ -1006,12 +1007,13 @@ function startTurnPhase(side){
     updateHud(); setPanel(null);
   }else{
     log(`<span class="k">The enemy camp stirs…</span>`,"sys");
-    setTimeout(runEnemyPhase, 500);
+    setTimeout(()=>{ runEnemyPhase(G.gen); }, 500);
   }
 }
 function endBattle(winner){
   if(G.over) return;
   G.over=winner;
+  G.gen++; // drop any enemy-phase callbacks still queued
   const el=document.getElementById("intro");
   el.innerHTML=`<div class="card">
     <h2>${winner==="player"?"⚑ Victory":"☠ Defeat"}</h2>
@@ -1036,29 +1038,35 @@ function syncEndBtn(){
   const b=document.getElementById("btnEnd");
   b.style.display=(G&&G.side==="player"&&!G.over)?"block":"none";
 }
-function runEnemyPhase(){
-  if(G?.over) return;
+function runEnemyPhase(gen){
+  if(!G||G.over) return;
+  if(G.gen!==gen) return; // stale call from a previous phase — drop it
+  if(G.side!=="enemy") return;
   const next=units.find(u=>u.alive&&u.side==="enemy"&&!u.used);
   if(!next){ startTurnPhase("player"); return; }
-  if(G.busy) { setTimeout(runEnemyPhase,300); return; }
+  if(G.busy) { setTimeout(()=>runEnemyPhase(gen),300); return; }
   G.busy=true;
   const plan=aiChooseAction(next);
   setTimeout(()=>{
+    if(!G||G.over||G.gen!==gen) return;
     G.busy=false;
-    if(G?.over) return;
-    if(!plan){ finishEnemyUnit(next); return; }
+    if(!plan){ finishEnemyUnit(next,gen); return; }
     const {tx,ty,verb}=plan;
     if((tx!==next.x||ty!==next.y)){
-      animateMove(next,tx,ty,()=>{ resolveEnemyVerb(next,verb,()=>finishEnemyUnit(next)); });
+      animateMove(next,tx,ty,()=>{
+        if(!G||G.over||G.gen!==gen) return;
+        resolveEnemyVerb(next,verb,()=>finishEnemyUnit(next,gen),gen);
+      });
     }else{
-      resolveEnemyVerb(next,verb,()=>finishEnemyUnit(next));
+      resolveEnemyVerb(next,verb,()=>finishEnemyUnit(next,gen),gen);
     }
   },650);
 }
-function finishEnemyUnit(u){
+function finishEnemyUnit(u,gen){
   u.used=true;
+  u.guard=false; // guard lasts only one round
   // small delay then next
-  setTimeout(()=>{ if(G?.over)return; runEnemyPhase(); },350);
+  setTimeout(()=>{ if(G?.over)return; runEnemyPhase(gen); },350);
 }
 function animateMove(u,tx,ty,done){
   const path=pathBetween(u.x,u.y,tx,ty)||[{x:u.x,y:u.y}];
@@ -1068,14 +1076,16 @@ function animateMove(u,tx,ty,done){
     if(G?.over) return;
     if(i>=path.length-1){ u.x=tx; u.y=ty; drawFog(); done&&done(); return; }
     i++;
+    // if the phase changed mid-animation (e.g. the player pressed End Round),
+    // finish walking quietly; done() bails without touching player UI
     u.x=path[i].x; u.y=path[i].y;
     setTimeout(step,stepMs);
   };
   step();
 }
-function resolveEnemyVerb(u,verb,done){
+function resolveEnemyVerb(u,verb,done,gen){
   setTimeout(()=>{
-    if(G?.over) return;
+    if(!G||G.over||G.gen!==gen) return;
     if(verb.kind==="attack"){
       const f=verb.target;
       if(!f.alive||dist(u,f)>AB[verb.ab].maxR){ done(); return; }
@@ -1083,6 +1093,7 @@ function resolveEnemyVerb(u,verb,done){
       const dmg=computeDamage({...u,elev:map[u.y][u.x].elev,terr:map[u.y][u.x].t},f,ab);
       const crit=chance(0.08);
       const final=crit?Math.round(dmg*1.5):dmg;
+      u.guard=false; // guard lasts only one round
       dealDamage(f,final,crit,"enemy");
       log(`${u.name} hits ${f.name} with <span class="k">${ab.name}</span> for ${final}${crit?' <span class="crit">crit!</span>':""}${f.guard?' <span class="k">(guard)</span>':""}`,"foe");
       setTimeout(done,350);
@@ -1241,7 +1252,10 @@ cFx.addEventListener("click",ev=>{
   }
   if(G.selected&&G.reach.has(p.x+","+p.y)){
     const u=G.selected;
-    animateMove(u,p.x,p.y,()=>{ updateHud(); setPanel(u); });
+    animateMove(u,p.x,p.y,()=>{
+      if(!G||G.over||G.side!==u.side) return; // phase changed mid-move (End Round) — don't re-enter player UI
+      updateHud(); setPanel(u);
+    });
     return;
   }
   clearSelection();
@@ -1271,7 +1285,7 @@ cFx.addEventListener("mousemove",ev=>{
   if(occ&&!inFog){
     html+=`<hr><b style="color:${occ.side==="player"?"#7ba6cc":"#cc8a7e"}">${occ.name}</b> ${occ.cls}<br>
       HP ${occ.hp}/${occ.hpMax} · MP ${occ.mp}/${occ.mpMax}<br>
-      atk ${occ.atk} · def ${occ.def} · eva ${occ.eva}% · mv ${occ.mv}`;
+      atk ${occ.atk} · def ${occ.def} · eva ${occ.eva}% · mv ${occ.mv}${occ.guard?" · ⛨ guarding":""}`;
     if(occ.side==="enemy"&&G?.selected&&G.selected.side==="player"&&G.mode==="attack"&&lastAbName){
       const ab=AB[lastAbName];
       const d=dist(G.selected,occ);
@@ -1290,6 +1304,7 @@ cFx.addEventListener("mousemove",ev=>{
   if(occ||G?.selected){
     tip.style.display="block";
     tip.innerHTML=html;
+    if(!occ&&!G?.selected) tip.style.display="none";
     const w=tip.offsetWidth;
     tip.style.left=clamp(ev.clientX+16,8,innerWidth-w-8)+"px";
     tip.style.top=clamp(ev.clientY+18,8,innerHeight-tip.offsetHeight-8)+"px";
